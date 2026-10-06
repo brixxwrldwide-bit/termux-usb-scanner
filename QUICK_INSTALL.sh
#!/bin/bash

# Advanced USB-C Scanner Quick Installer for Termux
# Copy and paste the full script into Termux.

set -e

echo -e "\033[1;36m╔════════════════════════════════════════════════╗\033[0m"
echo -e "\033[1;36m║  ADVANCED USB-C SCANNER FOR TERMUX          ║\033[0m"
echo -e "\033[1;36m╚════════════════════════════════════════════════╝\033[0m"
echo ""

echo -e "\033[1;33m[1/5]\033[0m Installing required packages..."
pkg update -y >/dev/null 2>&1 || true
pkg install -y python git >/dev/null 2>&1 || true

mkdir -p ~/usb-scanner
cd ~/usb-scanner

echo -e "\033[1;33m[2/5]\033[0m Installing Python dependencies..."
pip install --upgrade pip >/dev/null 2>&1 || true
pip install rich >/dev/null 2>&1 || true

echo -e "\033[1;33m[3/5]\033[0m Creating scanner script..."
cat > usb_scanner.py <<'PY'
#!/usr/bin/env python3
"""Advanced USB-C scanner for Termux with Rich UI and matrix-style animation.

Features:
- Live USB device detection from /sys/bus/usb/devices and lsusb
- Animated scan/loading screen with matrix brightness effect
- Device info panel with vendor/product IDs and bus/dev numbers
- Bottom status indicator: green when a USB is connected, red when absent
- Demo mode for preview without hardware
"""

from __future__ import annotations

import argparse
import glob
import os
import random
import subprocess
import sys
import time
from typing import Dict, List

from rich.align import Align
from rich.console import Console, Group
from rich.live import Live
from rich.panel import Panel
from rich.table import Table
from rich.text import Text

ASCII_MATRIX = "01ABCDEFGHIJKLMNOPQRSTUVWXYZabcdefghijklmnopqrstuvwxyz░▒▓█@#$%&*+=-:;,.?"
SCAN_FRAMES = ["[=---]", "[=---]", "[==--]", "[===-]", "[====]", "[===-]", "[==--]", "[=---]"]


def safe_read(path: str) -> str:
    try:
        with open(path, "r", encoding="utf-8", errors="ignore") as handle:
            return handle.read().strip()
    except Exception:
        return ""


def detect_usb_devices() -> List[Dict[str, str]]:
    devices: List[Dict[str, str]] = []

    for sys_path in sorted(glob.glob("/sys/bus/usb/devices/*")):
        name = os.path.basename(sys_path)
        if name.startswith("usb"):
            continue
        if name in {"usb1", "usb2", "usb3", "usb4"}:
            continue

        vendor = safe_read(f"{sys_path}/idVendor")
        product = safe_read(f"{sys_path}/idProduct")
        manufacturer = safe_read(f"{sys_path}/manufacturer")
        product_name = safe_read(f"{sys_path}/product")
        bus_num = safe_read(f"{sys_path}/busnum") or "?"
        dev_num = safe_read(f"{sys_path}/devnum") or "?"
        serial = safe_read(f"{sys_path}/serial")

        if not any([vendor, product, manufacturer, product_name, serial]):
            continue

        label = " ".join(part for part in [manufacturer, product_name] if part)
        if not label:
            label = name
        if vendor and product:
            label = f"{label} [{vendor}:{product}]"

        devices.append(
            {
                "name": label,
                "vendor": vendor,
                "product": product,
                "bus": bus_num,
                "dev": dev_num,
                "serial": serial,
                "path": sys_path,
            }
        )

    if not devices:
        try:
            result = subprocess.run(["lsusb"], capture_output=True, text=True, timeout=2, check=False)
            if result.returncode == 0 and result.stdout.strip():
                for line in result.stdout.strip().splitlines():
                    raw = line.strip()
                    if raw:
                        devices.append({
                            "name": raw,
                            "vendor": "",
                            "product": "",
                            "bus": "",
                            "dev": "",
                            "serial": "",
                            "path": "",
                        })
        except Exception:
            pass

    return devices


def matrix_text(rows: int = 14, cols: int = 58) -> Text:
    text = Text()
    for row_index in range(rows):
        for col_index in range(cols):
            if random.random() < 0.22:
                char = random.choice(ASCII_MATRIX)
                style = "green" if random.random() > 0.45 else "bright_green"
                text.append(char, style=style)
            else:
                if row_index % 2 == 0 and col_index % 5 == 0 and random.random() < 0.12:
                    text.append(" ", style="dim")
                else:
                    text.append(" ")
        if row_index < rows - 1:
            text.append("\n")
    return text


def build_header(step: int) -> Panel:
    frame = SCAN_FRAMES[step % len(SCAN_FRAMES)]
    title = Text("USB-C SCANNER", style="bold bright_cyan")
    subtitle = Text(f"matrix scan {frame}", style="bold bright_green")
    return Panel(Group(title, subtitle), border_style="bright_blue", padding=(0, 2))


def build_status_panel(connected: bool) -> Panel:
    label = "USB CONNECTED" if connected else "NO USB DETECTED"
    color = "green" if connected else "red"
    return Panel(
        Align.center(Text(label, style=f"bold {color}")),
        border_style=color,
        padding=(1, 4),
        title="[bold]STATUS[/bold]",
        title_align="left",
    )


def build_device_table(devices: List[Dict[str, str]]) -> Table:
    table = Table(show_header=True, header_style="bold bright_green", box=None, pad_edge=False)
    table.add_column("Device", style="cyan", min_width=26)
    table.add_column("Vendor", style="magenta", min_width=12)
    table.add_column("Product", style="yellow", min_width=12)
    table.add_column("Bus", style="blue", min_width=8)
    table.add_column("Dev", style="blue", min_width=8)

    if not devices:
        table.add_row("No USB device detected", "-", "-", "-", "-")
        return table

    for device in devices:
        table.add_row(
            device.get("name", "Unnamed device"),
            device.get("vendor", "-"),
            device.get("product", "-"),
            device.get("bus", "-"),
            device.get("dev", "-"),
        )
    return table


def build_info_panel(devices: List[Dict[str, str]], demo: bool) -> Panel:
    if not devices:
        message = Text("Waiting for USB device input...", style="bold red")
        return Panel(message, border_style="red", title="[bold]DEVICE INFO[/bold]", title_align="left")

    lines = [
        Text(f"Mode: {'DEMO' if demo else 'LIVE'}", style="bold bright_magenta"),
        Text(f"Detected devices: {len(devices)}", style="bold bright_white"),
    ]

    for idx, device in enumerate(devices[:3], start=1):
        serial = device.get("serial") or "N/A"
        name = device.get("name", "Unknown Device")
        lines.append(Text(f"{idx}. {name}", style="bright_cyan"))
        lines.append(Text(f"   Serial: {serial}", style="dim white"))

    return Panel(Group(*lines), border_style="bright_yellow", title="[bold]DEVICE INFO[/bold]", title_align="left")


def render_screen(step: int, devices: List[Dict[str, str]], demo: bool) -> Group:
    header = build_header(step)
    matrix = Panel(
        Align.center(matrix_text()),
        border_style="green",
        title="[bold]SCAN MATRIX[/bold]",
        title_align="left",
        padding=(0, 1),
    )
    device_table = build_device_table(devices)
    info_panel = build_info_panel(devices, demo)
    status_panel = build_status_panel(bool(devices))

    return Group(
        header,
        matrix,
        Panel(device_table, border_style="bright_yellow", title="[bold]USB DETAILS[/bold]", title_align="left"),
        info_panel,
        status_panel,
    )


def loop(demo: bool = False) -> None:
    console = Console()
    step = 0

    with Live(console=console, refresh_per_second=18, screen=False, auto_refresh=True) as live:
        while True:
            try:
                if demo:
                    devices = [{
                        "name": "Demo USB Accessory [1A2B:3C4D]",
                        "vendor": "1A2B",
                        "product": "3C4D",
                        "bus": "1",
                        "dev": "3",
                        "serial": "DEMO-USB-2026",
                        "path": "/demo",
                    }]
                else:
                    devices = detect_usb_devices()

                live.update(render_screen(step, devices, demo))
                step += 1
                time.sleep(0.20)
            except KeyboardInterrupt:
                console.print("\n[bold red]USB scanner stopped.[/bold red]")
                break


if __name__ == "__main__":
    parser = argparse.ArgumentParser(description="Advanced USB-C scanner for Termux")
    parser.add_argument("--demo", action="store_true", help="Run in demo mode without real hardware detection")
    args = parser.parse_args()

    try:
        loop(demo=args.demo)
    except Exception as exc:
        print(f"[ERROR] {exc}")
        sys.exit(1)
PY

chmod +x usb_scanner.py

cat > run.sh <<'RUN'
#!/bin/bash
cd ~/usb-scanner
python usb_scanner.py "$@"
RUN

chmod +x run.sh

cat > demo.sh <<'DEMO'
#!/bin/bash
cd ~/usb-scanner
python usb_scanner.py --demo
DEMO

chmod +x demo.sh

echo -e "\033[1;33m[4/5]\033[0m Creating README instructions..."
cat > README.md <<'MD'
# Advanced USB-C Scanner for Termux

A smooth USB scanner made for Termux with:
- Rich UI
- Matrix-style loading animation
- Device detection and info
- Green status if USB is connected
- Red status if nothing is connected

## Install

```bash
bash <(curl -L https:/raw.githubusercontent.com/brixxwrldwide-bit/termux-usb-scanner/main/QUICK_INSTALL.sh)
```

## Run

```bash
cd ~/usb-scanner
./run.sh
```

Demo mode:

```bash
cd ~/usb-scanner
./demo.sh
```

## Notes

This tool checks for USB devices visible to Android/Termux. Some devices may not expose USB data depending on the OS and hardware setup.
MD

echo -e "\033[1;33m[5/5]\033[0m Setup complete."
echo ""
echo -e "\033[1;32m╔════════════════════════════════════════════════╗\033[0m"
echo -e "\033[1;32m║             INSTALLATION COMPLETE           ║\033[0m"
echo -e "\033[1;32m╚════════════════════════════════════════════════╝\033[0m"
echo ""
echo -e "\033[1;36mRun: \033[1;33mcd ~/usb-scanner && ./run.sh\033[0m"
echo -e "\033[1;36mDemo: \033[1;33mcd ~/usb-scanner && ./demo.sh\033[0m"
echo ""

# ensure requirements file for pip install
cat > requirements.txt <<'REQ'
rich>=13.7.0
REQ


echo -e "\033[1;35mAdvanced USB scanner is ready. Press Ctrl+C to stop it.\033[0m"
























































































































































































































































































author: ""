@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""Advanced USB-C scanner for Termux with Rich UI and matrix-style animation.
+
+Features:
+- Live USB device detection from /sys/bus/usb/devices and lsusb
+- Animated scan/loading screen with matrix brightness effect
+- Device info panel with vendor/product IDs and bus/dev numbers
+- Bottom status indicator: green when a USB is connected, red when absent
+- Demo mode for preview without hardware
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import os
+import random
+import subprocess
+import sys
+import time
+from typing import Dict, List
+
+from rich.align import Align
+from rich.console import Console, Group
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+
+ASCII_MATRIX = "01ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz░▒▓█@#$%&*+=-:;,.?"
+SCAN_FRAMES = ["[=---]", "[=---]", "[==--]", "[===-]", "[====]", "[===-]", "[==--]", "[=---]"]
+
+
+def safe_read(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+            return handle.read().strip()
+    except Exception:
+        return ""
+
+
+def detect_usb_devices() -> List[Dict[str, str]]:
+    devices: List[Dict[str, str]] = []
+
+    for sys_path in sorted(glob.glob("/sys/bus/usb/devices/*")):
+        name = os.path.basename(sys_path)
+        if name.startswith("usb"):
+            continue
+        if name in {"usb1", "usb2", "usb3", "usb4"}:
+            continue
+
+        vendor = safe_read(f"{sys_path}/idVendor")
+        product = safe_read(f"{sys_path}/idProduct")
+        manufacturer = safe_read(f"{sys_path}/manufacturer")
+        product_name = safe_read(f"{sys_path}/product")
+        bus_num = safe_read(f"{sys_path}/busnum") or "?"
+        dev_num = safe_read(f"{sys_path}/devnum") or "?"
+        serial = safe_read(f"{sys_path}/serial")
+        path = sys_path
+
+        if not any([vendor, product, manufacturer, product_name, serial]):
+            continue
+
+        label = " ".join(part for part in [manufacturer, product_name] if part)
+        if not label:
+            label = name
+        if vendor and product:
+            label = f"{label} [{vendor}:{product}]"
+
+        devices.append(
+            {
+                "name": label,
+                "vendor": vendor,
+                "product": product,
+                "bus": bus_num,
+                "dev": dev_num,
+                "serial": serial,
+                "path": path,
+            }
+        )
+
+    if not devices:
+        try:
+            result = subprocess.run(
+                ["lsusb"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                for line in result.stdout.strip().splitlines():
+                    raw = line.strip()
+                    if raw:
+                        devices.append(
+                            {
+                                "name": raw,
+                                "vendor": "",
+                                "product": "",
+                                "bus": "",
+                                "dev": "",
+                                "serial": "",
+                                "path": "",
+                            }
+                        )
+        except Exception:
+            pass
+
+    return devices
+
+
+def matrix_text(rows: int = 14, cols: int = 58) -> Text:
+    text = Text()
+    for row_index in range(rows):
+        for col_index in range(cols):
+            if random.random() < 0.22:
+                char = random.choice(ASCII_MATRIX)
+                style = "green" if random.random() > 0.45 else "bright_green"
+                text.append(char, style=style)
+            else:
+                if row_index % 2 == 0 and col_index % 5 == 0 and random.random() < 0.12:
+                    text.append(" ", style="dim")
+                else:
+                    text.append(" ")
+        if row_index < rows - 1:
+            text.append("\n")
+    return text
+
+
+def build_header(step: int) -> Panel:
+    frame = SCAN_FRAMES[step % len(SCAN_FRAMES)]
+    title = Text("USB-C SCANNER", style="bold bright_cyan")
+    subtitle = Text(f"matrix scan {frame}", style="bold bright_green")
+    return Panel(Group(title, subtitle), border_style="bright_blue", padding=(0, 2))
+
+
+def build_status_panel(connected: bool) -> Panel:
+    label = "USB CONNECTED" if connected else "NO USB DETECTED"
+    color = "green" if connected else "red"
+    return Panel(
+        Align.center(Text(label, style=f"bold {color}")),
+        border_style=color,
+        padding=(1, 4),
+        title="[bold]STATUS[/bold]",
+        title_align="left",
+    )
+
+
+def build_device_table(devices: List[Dict[str, str]]) -> Table:
+    table = Table(show_header=True, header_style="bold bright_green", box=None, pad_edge=False)
+    table.add_column("Device", style="cyan", min_width=26)
+    table.add_column("Vendor", style="magenta", min_width=12)
+    table.add_column("Product", style="yellow", min_width=12)
+    table.add_column("Bus", style="blue", min_width=8)
+    table.add_column("Dev", style="blue", min_width=8)
+
+    if not devices:
+        table.add_row("No USB device detected", "-", "-", "-", "-")
+        return table
+
+    for device in devices:
+        table.add_row(
+            device.get("name", "Unnamed device"),
+            device.get("vendor", "-"),
+            device.get("product", "-"),
+            device.get("bus", "-"),
+            device.get("dev", "-"),
+        )
+    return table
+
+
+def build_info_panel(devices: List[Dict[str, str]], demo: bool) -> Panel:
+    if not devices:
+        message = Text("Waiting for USB device input...", style="bold red")
+        return Panel(message, border_style="red", title="[bold]DEVICE INFO[/bold]", title_align="left")
+
+    lines = [
+        Text(f"Mode: {'DEMO' if demo else 'LIVE'}", style="bold bright_magenta"),
+        Text(f"Detected devices: {len(devices)}", style="bold bright_white"),
+    ]
+
+    for idx, device in enumerate(devices[:3], start=1):
+        serial = device.get("serial") or "N/A"
+        name = device.get("name", "Unknown Device")
+        lines.append(Text(f"{idx}. {name}", style="bright_cyan"))
+        lines.append(Text(f"   Serial: {serial}", style="dim white"))
+
+    return Panel(Group(*lines), border_style="bright_yellow", title="[bold]DEVICE INFO[/bold]", title_align="left")
+
+
+def render_screen(step: int, devices: List[Dict[str, str]], demo: bool) -> Group:
+    header = build_header(step)
+    matrix = Panel(
+        Align.center(matrix_text()),
+        border_style="green",
+        title="[bold]SCAN MATRIX[/bold]",
+        title_align="left",
+        padding=(0, 1),
+    )
+    device_table = build_device_table(devices)
+    info_panel = build_info_panel(devices, demo)
+    status_panel = build_status_panel(bool(devices))
+
+    body = Group(
+        header,
+        matrix,
+        Panel(device_table, border_style="bright_yellow", title="[bold]USB DETAILS[/bold]", title_align="left"),
+        info_panel,
+        status_panel,
+    )
+    return body
+
+
+def loop(demo: bool = False) -> None:
+    console = Console()
+    step = 0
+
+    with Live(console=console, refresh_per_second=18, screen=False, auto_refresh=True) as live:
+        while True:
+            try:
+                if demo:
+                    devices = [
+                        {
+                            "name": "Demo USB Accessory [1A2B:3C4D]",
+                            "vendor": "1A2B",
+                            "product": "3C4D",
+                            "bus": "1",
+                            "dev": "3",
+                            "serial": "DEMO-USB-2026",
+                            "path": "/demo",
+                        }
+                    ]
+                else:
+                    devices = detect_usb_devices()
+
+                live.update(render_screen(step, devices, demo))
+                step += 1
+                time.sleep(0.20)
+            except KeyboardInterrupt:
+                console.print("\n[bold red]USB scanner stopped.[/bold red]")
+                break
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Advanced USB-C scanner for Termux")
+    parser.add_argument("--demo", action="store_true", help="Run in demo mode without real hardware detection")
+    args = parser.parse_args()
+
+    try:
+        loop(demo=args.demo)
+    except Exception as exc:
+        print(f"[ERROR] {exc}")
+        sys.exit(1)
+
+
